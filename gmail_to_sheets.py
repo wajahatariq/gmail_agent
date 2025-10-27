@@ -3,291 +3,302 @@ import os
 import time
 import json
 import base64
+import threading
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
-from datetime import datetime, time as dt_time, timezone, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from dotenv import load_dotenv
-from litellm import completion  # liteLLM
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from litellm import completion
 
-if "GMAIL_CREDENTIALS" in st.secrets:
-    creds_json = json.loads(st.secrets["GMAIL_CREDENTIALS"])
-    with open("credentials.json", "w") as f:
-        json.dump(creds_json, f)
+# -------------------------
+# Configuration / Secrets
+# -------------------------
+st.set_page_config(page_title="Gmail → Trello (AI)", layout="wide")
+st.title("Gmail → Trello (AI)")
 
-if "GMAIL_TOKEN" in st.secrets:
-    token_json = json.loads(st.secrets["GMAIL_TOKEN"])
-    with open("token.json", "w") as f:
-        json.dump(token_json, f)
-# ---------------------------
-# CONFIG / LOAD SECRETS
-# ---------------------------
-# Streamlit Cloud: set secrets in app settings and access via st.secrets
-# Locally: create a .env with keys (not committed)
-load_dotenv()
+st.markdown("Fetch Inbox emails (last 24 hours), detect project-related messages using AI, and create Trello cards with delay and an Auto Mode option.")
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# Sidebar: settings
+st.sidebar.header("Settings")
+delay_seconds = st.sidebar.number_input("Delay between Trello inserts (seconds)", min_value=5, max_value=300, value=60)
+check_interval_minutes = st.sidebar.number_input("Auto-check interval (minutes)", min_value=1, max_value=180, value=15)
+max_emails_per_run = st.sidebar.number_input("Max emails to process per run", min_value=1, max_value=100, value=10)
+st.sidebar.markdown("---")
 
-# Prefer Streamlit secrets, fallback to env
-def get_secret(name):
-    # Streamlit secrets (secure on Streamlit Cloud)
-    if st.runtime.exists() and hasattr(st, "secrets") and name in st.secrets:
-        return st.secrets[name]
-    return os.getenv(name)
+# Secrets: prefer st.secrets (Streamlit Cloud). For local, fall back to environment variables.
+def secret(name):
+    return st.secrets.get(name) if hasattr(st, "secrets") else os.getenv(name)
 
-TRELLO_KEY = get_secret("TRELLO_KEY")
-TRELLO_TOKEN = get_secret("TRELLO_TOKEN")
-TRELLO_LIST_ID = get_secret("TRELLO_LIST_ID")
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
-LLM_MODEL = get_secret("LLM_MODEL") or "groq/llama-3.1-8b-instant"
+TRELLO_KEY = secret("TRELLO_KEY") or os.getenv("TRELLO_KEY")
+TRELLO_TOKEN = secret("TRELLO_TOKEN") or os.getenv("TRELLO_TOKEN")
+TRELLO_LIST_ID = secret("TRELLO_LIST_ID") or os.getenv("TRELLO_LIST_ID")
+GROQ_API_KEY = secret("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
+LLM_MODEL = secret("LLM_MODEL") or os.getenv("LLM_MODEL") or "groq/llama-3.1-8b-instant"
 
-# Put Groq key into env for litellm to pick it up
+# Recreate credentials.json and token.json from secrets if present
+if hasattr(st, "secrets"):
+    if "GMAIL_CREDENTIALS" in st.secrets:
+        try:
+            creds_json = json.loads(st.secrets["GMAIL_CREDENTIALS"])
+            with open("credentials.json", "w", encoding="utf-8") as f:
+                json.dump(creds_json, f)
+        except Exception:
+            pass
+    if "GMAIL_TOKEN" in st.secrets:
+        try:
+            token_json = json.loads(st.secrets["GMAIL_TOKEN"])
+            with open("token.json", "w", encoding="utf-8") as f:
+                json.dump(token_json, f)
+        except Exception:
+            pass
+
+# Put GROQ key into environment for liteLLM
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
-# ---------------------------
-# UTIL: Validate config
-# ---------------------------
-def validate_config(allow_missing_llm=False):
+# Validate critical secrets
+def validate_required():
     missing = []
-    for k in ["TRELLO_KEY", "TRELLO_TOKEN", "TRELLO_LIST_ID"]:
-        if not globals().get(k):
-            missing.append(k)
-    if not allow_missing_llm and not GROQ_API_KEY:
-        missing.append("GROQ_API_KEY")
+    for name, val in [("TRELLO_KEY", TRELLO_KEY), ("TRELLO_TOKEN", TRELLO_TOKEN), ("TRELLO_LIST_ID", TRELLO_LIST_ID)]:
+        if not val:
+            missing.append(name)
     if missing:
-        raise EnvironmentError(f"Missing required secrets/env: {', '.join(missing)}")
+        raise EnvironmentError(f"Missing required secrets: {', '.join(missing)}")
 
-# ---------------------------
-# GMAIL: Auth and fetch
-# ---------------------------
-def get_credentials_local():
-    """Get Gmail credentials. This will open the OAuth browser flow the first time locally.
-       (On Streamlit Cloud this local browser flow won't work — see deployment note.)"""
+try:
+    validate_required()
+    st.sidebar.success("Trello keys loaded.")
+except Exception as e:
+    st.sidebar.error(str(e))
+    st.stop()
+
+# -------------------------
+# Gmail helpers
+# -------------------------
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+def get_gmail_credentials():
+    """Return google oauth credentials, using token.json or credentials.json.
+       On first local run, will open local browser for consent.
+       In deployed mode, token.json can be provided via st.secrets['GMAIL_TOKEN']."""
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                # Force re-auth
-                try:
-                    os.remove("token.json")
-                except Exception:
-                    pass
-                creds = None
-        if not creds:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open("token.json", "w") as f:
+    # If there is no token.json but credentials.json exists, use local flow (only works locally)
+    if not creds and os.path.exists("credentials.json"):
+        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open("token.json", "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+    # Refresh if necessary
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            with open("token.json", "w", encoding="utf-8") as f:
                 f.write(creds.to_json())
+        except Exception:
+            # If refresh fails, remove token to force reauth locally later
+            try:
+                os.remove("token.json")
+            except Exception:
+                pass
+            creds = None
     return creds
 
 def build_gmail_service():
-    creds = get_credentials_local()
+    creds = get_gmail_credentials()
+    if not creds:
+        raise RuntimeError("No Google credentials available. Run locally to authorize or provide token.json via secrets.")
     return build("gmail", "v1", credentials=creds)
 
-def start_of_today_unix_utc(tz_name="Asia/Karachi"):
-    # Compute start of day in user's timezone then convert to UNIX seconds (Gmail uses 'after' as seconds)
-    tz = ZoneInfo(tz_name)
-    local_now = datetime.now(tz)
-    local_midnight = datetime(local_now.year, local_now.month, local_now.day, 0, 0, 0, tzinfo=tz)
-    # convert to UTC timestamp (seconds)
-    utc_ts = int(local_midnight.astimezone(timezone.utc).timestamp())
-    return utc_ts
-
-def fetch_todays_emails(max_results=50):
+def fetch_inbox_last_24h(max_results=50):
     service = build_gmail_service()
-    after_ts = start_of_today_unix_utc()
-    query = f"after:{after_ts}"
+    query = "in:inbox newer_than:1d"
     resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
-    messages = resp.get("messages", [])
-    out = []
-    for m in messages:
+    msgs = resp.get("messages", [])
+    emails = []
+    for m in msgs:
         msg = service.users().messages().get(userId="me", id=m["id"], format="full").execute()
-        payload = msg.get("payload", {})
-        headers = payload.get("headers", [])
-        subject = ""
-        sender = ""
-        for h in headers:
-            name = h.get("name", "").lower()
-            if name == "subject":
-                subject = h.get("value", "")
-            elif name == "from":
-                sender = h.get("value", "")
-        # decode body
-        body = ""
-        # gmail parts can be nested; handle simple two-level case
-        parts = payload.get("parts", [])
-        if parts:
-            for p in parts:
-                data = (p.get("body") or {}).get("data")
-                if data:
-                    decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                    if p.get("mimeType","").lower() == "text/html":
-                        body += BeautifulSoup(decoded, "html.parser").get_text()
-                    else:
-                        body += decoded
-        else:
-            data = (payload.get("body") or {}).get("data")
-            if data:
-                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-        out.append({
-            "id": m["id"],
-            "subject": subject,
-            "from": sender,
-            "body": body.strip()
-        })
-    return out
+        headers = msg.get("payload", {}).get("headers", [])
+        hmap = {h["name"].lower(): h["value"] for h in headers}
+        subject = hmap.get("subject", "(No Subject)")
+        sender = hmap.get("from", "Unknown Sender")
+        snippet = msg.get("snippet", "")
+        # build a lightweight content string for AI
+        content = f"From: {sender}\nSubject: {subject}\n\n{snippet}"
+        emails.append({"id": m["id"], "subject": subject, "from": sender, "snippet": snippet, "content": content})
+    return emails
 
-# ---------------------------
-# AI PARSING (LiteLLM/Groq)
-# ---------------------------
-def analyze_with_ai(email_text):
-    prompt = f"""
-You are an AI email parser.
-Decide if this email describes a project request or assignment. If yes, extract:
-- project_name
-- client_name
-- description
-- due_date (ISO or natural language or empty)
-- dropbox_links (comma separated)
-
-Return **valid JSON only** with keys:
-{{"is_project": bool, "project_name": str, "client_name": str, "description": str, "due_date": str, "dropbox_links": str}}
-Email:
-{email_text}
-"""
+# -------------------------
+# AI parsing (LiteLLM / Groq)
+# -------------------------
+def analyze_is_project(email_content):
+    """Return tuple (is_project: bool, ai_error: str or None). Handles rate-limit errors by raising them to caller."""
+    prompt = (
+        "Decide if this email is project-related (work, assignment, request for deliverable). "
+        "Answer only with 'yes' or 'no'.\n\nEmail:\n" + email_content
+    )
     try:
         resp = completion(model=LLM_MODEL, messages=[{"role":"user","content":prompt}])
-        text = resp["choices"][0]["message"]["content"]
-        parsed = json.loads(text)
-        return parsed
+        text = resp["choices"][0]["message"]["content"].strip().lower()
+        return ("yes" in text, None)
     except Exception as e:
-        return {"is_project": False, "error": str(e)}
+        # propagate errors (caller will handle retries for rate limits)
+        return (False, str(e))
 
-# ---------------------------
-# TRELLO: create card
-# ---------------------------
-def create_trello_card(project_obj):
+# -------------------------
+# Trello helpers
+# -------------------------
+def create_trello_card(title, desc):
     url = "https://api.trello.com/1/cards"
-    desc = (
-        f"Client: {project_obj.get('client_name','N/A')}\n\n"
-        f"Description: {project_obj.get('description','N/A')}\n\n"
-        f"Due Date: {project_obj.get('due_date','N/A')}\n\n"
-        f"Links: {project_obj.get('dropbox_links','None')}"
-    )
     params = {
         "key": TRELLO_KEY,
         "token": TRELLO_TOKEN,
         "idList": TRELLO_LIST_ID,
-        "name": project_obj.get("project_name", "Unnamed Project"),
+        "name": title,
         "desc": desc
     }
     r = requests.post(url, params=params)
-    return r.status_code in (200, 201), r
+    return r.status_code in (200, 201), r.status_code, r.text
 
-# ---------------------------
-# STREAMLIT UI
-# ---------------------------
-st.set_page_config(page_title="Gmail → Trello AI", page_icon="📧", layout="wide")
-st.title("📧 Gmail → Trello (AI)")
+# -------------------------
+# Processing logic
+# -------------------------
+# Keep a simple in-memory set of processed message ids to avoid duplicates across cycles.
+if "processed_ids" not in st.session_state:
+    st.session_state["processed_ids"] = set()
+if "auto_mode" not in st.session_state:
+    st.session_state["auto_mode"] = False
+if "last_run" not in st.session_state:
+    st.session_state["last_run"] = None
+if "log_lines" not in st.session_state:
+    st.session_state["log_lines"] = []
 
-st.markdown(
-    "Fetch today's Gmail, use AI to detect project emails, and insert them into Trello with a configurable delay to handle rate limits."
-)
+def log(msg):
+    timestamp = datetime.now(timezone.utc).astimezone().isoformat()
+    line = f"[{timestamp}] {msg}"
+    st.session_state["log_lines"].append(line)
+    # keep size reasonable
+    st.session_state["log_lines"] = st.session_state["log_lines"][-500:]
 
-# Show config and quick validate
-with st.expander("🔧 Configuration / Secrets (hidden)"):
-    st.write("Use Streamlit Secrets or local .env (do NOT commit keys).")
-try:
-    validate_config(allow_missing_llm=True)
-    st.success("Configuration loaded (Trello keys present).")
-except Exception as e:
-    st.error(f"Configuration error: {e}")
+def process_once(max_emails):
+    """Fetch recent inbox emails (24h), filter out already processed, analyze, insert to Trello with delay where configured.
+       Returns summary dict."""
+    summary = {"fetched": 0, "processed": 0, "inserted": 0, "skipped": 0, "errors": 0}
+    try:
+        emails = fetch_inbox_last_24h(max_results=max_emails)
+    except Exception as e:
+        log(f"Failed to fetch emails: {e}")
+        summary["errors"] += 1
+        return summary
 
-col1, col2 = st.columns([2,1])
-with col1:
-    if st.button("📬 Fetch Today's Emails"):
-        with st.spinner("Fetching emails from Gmail..."):
-            try:
-                emails = fetch_todays_emails(max_results=50)
-                st.session_state["emails"] = emails
-                st.success(f"Fetched {len(emails)} emails from today.")
-            except Exception as ex:
-                st.error(f"Failed to fetch emails: {ex}")
-
-    if "emails" in st.session_state:
-        emails = st.session_state["emails"]
-        st.write(f"### Today's emails ({len(emails)})")
-        for idx, e in enumerate(emails):
-            with st.expander(f"{idx+1}. {e['subject'] or '(no subject)'}"):
-                st.write(f"**From:** {e['from']}")
-                st.write(e["body"][:1000] + ("..." if len(e["body"])>1000 else ""))
-                if st.button(f"Parse with AI (preview) — #{idx+1}", key=f"parse_{idx}"):
-                    with st.spinner("Parsing email..."):
-                        ai = analyze_with_ai(e["body"])
-                        st.json(ai)
-
-with col2:
-    st.sidebar.header("Insertion settings")
-    delay_seconds = st.sidebar.number_input("Delay between Trello inserts (seconds)", min_value=1, max_value=300, value=20)
-    max_process = st.sidebar.number_input("Max emails to process in one run", min_value=1, max_value=50, value=10)
-    run_insert = st.sidebar.button("🚀 Insert Project Emails to Trello")
-
-# Insert flow
-if run_insert:
-    if "emails" not in st.session_state or not st.session_state["emails"]:
-        st.warning("No emails fetched yet. Click 'Fetch Today's Emails' first.")
-    else:
-        # validate config (ensure Groq can be missing; but TRELLO needed)
-        try:
-            validate_config(allow_missing_llm=False)
-        except Exception as ex:
-            st.error(f"Config problem: {ex}")
-            st.stop()
-
-        emails = st.session_state["emails"][:max_process]
-        total = len(emails)
-        progress = st.progress(0)
-        log_area = st.empty()
-        inserted = 0
-        for i, e in enumerate(emails):
-            log_area.text(f"Parsing email {i+1}/{total}: {e['subject']}")
-            ai_result = analyze_with_ai(e["body"])
-            # show AI error if any
-            if ai_result.get("error"):
-                log_area.text(f"AI error for email {i+1}: {ai_result['error']}")
-                # if rate limit, show friendly message and retry after short sleep
-                if "rate limit" in ai_result["error"].lower() or "RateLimitError".lower() in ai_result["error"].lower():
-                    st.warning("Rate limit hit. Waiting one delay cycle before retry...")
-                    time.sleep(delay_seconds)
-                    # try once more
-                    ai_result = analyze_with_ai(e["body"])
-            if ai_result.get("is_project"):
-                ok, resp = create_trello_card(ai_result)
-                if ok:
-                    inserted += 1
-                    log_area.text(f"✅ Created Trello card for: {ai_result.get('project_name','(unnamed)')}")
-                else:
-                    log_area.text(f"❌ Trello error for {ai_result.get('project_name','(unnamed)')}: {resp.status_code} {resp.text}")
+    summary["fetched"] = len(emails)
+    for i, e in enumerate(emails, 1):
+        mid = e["id"]
+        if mid in st.session_state["processed_ids"]:
+            log(f"Skipping already processed message: {e['subject']}")
+            summary["skipped"] += 1
+            continue
+        st.session_state["processed_ids"].add(mid)
+        summary["processed"] += 1
+        log(f"Analyzing ({i}/{len(emails)}): {e['subject']}")
+        is_project, ai_error = analyze_is_project(e["content"])
+        if ai_error:
+            # check for rate-limit or other provider hints; if rate limit, wait and retry once
+            err_lower = ai_error.lower()
+            log(f"AI error: {ai_error}")
+            summary["errors"] += 1
+            if "rate limit" in err_lower or "rate_limit" in err_lower or "ratelimit" in err_lower:
+                log("AI rate limit detected. Waiting one delay cycle then retrying.")
+                time.sleep(delay_seconds)
+                is_project, ai_error = analyze_is_project(e["content"])
+                if ai_error:
+                    log(f"AI retry failed: {ai_error}")
+                    summary["errors"] += 1
+                    continue
             else:
-                log_area.text(f"⏭️ Skipped: Not a project or AI said no. Subject: {e['subject']}")
-            progress.progress((i+1)/total)
-            # countdown UI for delay
-            for s in range(delay_seconds, 0, -1):
-                st.sidebar.markdown(f"Waiting **{s}s** before next insert...")
-                time.sleep(1)
-        st.success(f"Done. Inserted {inserted} cards out of {total} processed.")
+                continue
+        if is_project:
+            title = e["subject"] or "Unnamed project"
+            desc = f"From: {e['from']}\n\nSnippet:\n{e['snippet']}"
+            ok, code, text = create_trello_card(title, desc)
+            if ok:
+                log(f"Inserted card for: {title}")
+                summary["inserted"] += 1
+            else:
+                log(f"Trello error ({code}): {text}")
+                summary["errors"] += 1
+            # delay between inserts
+            log(f"Waiting {delay_seconds} seconds before next action.")
+            time.sleep(delay_seconds)
+        else:
+            log(f"Skipped (not project): {e['subject']}")
+            summary["skipped"] += 1
+    return summary
 
-st.markdown("---")
-st.caption("Built with LiteLLM (Groq) + Gmail API + Trello API. Keep keys in secrets; don't commit them.")
+# -------------------------
+# Auto mode thread
+# -------------------------
+auto_thread = None
 
+def auto_worker(stop_event):
+    log("Auto mode started.")
+    while not stop_event.is_set():
+        log("Starting processing cycle.")
+        summary = process_once(max_emails_per_run)
+        log(f"Cycle summary: fetched={summary['fetched']}, processed={summary['processed']}, inserted={summary['inserted']}, skipped={summary['skipped']}, errors={summary['errors']}")
+        st.session_state["last_run"] = datetime.now().isoformat()
+        # wait for next check interval, but break early if stop_event set
+        for _ in range(int(check_interval_minutes * 60)):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+    log("Auto mode stopped.")
 
+# Controls UI
+col1, col2 = st.columns([3,1])
+with col1:
+    st.subheader("Manual run")
+    if st.button("Run now"):
+        st.session_state["last_run"] = None
+        st.session_state["log_lines"] = st.session_state.get("log_lines", [])
+        summary = process_once(max_emails_per_run)
+        st.success(f"Run complete. Inserted {summary['inserted']} cards. Processed {summary['processed']} emails.")
+with col2:
+    st.subheader("Auto Mode")
+    if "auto_stop_event" not in st.session_state:
+        st.session_state["auto_stop_event"] = None
+    auto_toggle = st.checkbox("Enable Auto Mode", value=st.session_state["auto_mode"])
+    st.session_state["auto_mode"] = auto_toggle
+    if auto_toggle and (st.session_state.get("auto_stop_event") is None or st.session_state["auto_stop_event"].is_set()):
+        # start thread
+        stop_event = threading.Event()
+        st.session_state["auto_stop_event"] = stop_event
+        thread = threading.Thread(target=auto_worker, args=(stop_event,), daemon=True)
+        st.session_state["auto_thread"] = thread
+        thread.start()
+        st.success("Auto Mode enabled.")
+    if (not auto_toggle) and st.session_state.get("auto_stop_event"):
+        stop_event = st.session_state["auto_stop_event"]
+        stop_event.set()
+        st.session_state["auto_stop_event"] = None
+        st.success("Auto Mode disabled.")
+
+# Logs and status
+st.markdown("## Status")
+last_run = st.session_state.get("last_run")
+st.write(f"Last run: {last_run or 'Never'}")
+st.write(f"Processed message ids in this session: {len(st.session_state['processed_ids'])}")
+
+st.markdown("## Logs")
+log_area = st.empty()
+log_lines = st.session_state.get("log_lines", [])
+if log_lines:
+    log_area.text("\n".join(log_lines[-200:]))
+else:
+    log_area.text("No logs yet.")
+
+st.caption("Notes: Auto Mode will run in the background of the Streamlit session. For Gmail OAuth, provide token.json via Streamlit secrets as GMAIL_TOKEN or run locally once to generate token.json and then store it in secrets. Do not commit credentials to Git.")
