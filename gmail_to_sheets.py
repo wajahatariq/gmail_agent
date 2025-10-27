@@ -110,7 +110,7 @@ def build_gmail_service():
 
 def fetch_inbox_last_24h(max_results=50):
     service = build_gmail_service()
-    query = "in:inbox newer_than:1d"
+    query = "category:primary newer_than:1d"
     resp = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
     msgs = resp.get("messages", []) or []
     emails = []
@@ -363,3 +363,4 @@ if last_logs:
 else:
     st.info("No logs yet. Click 'Fetch & Upload Projects' to run.")
 st.caption("Keep credentials in Streamlit Secrets. Token.json can be pasted as GMAIL_TOKEN if deploying to Streamlit Cloud.")
+
