@@ -19,6 +19,11 @@ if "GMAIL_CREDENTIALS" in st.secrets:
     creds_json = json.loads(st.secrets["GMAIL_CREDENTIALS"])
     with open("credentials.json", "w") as f:
         json.dump(creds_json, f)
+
+if "GMAIL_TOKEN" in st.secrets:
+    token_json = json.loads(st.secrets["GMAIL_TOKEN"])
+    with open("token.json", "w") as f:
+        json.dump(token_json, f)
 # ---------------------------
 # CONFIG / LOAD SECRETS
 # ---------------------------
@@ -284,4 +289,5 @@ if run_insert:
 
 st.markdown("---")
 st.caption("Built with LiteLLM (Groq) + Gmail API + Trello API. Keep keys in secrets; don't commit them.")
+
 
