@@ -450,7 +450,7 @@ with col1:
     if st.button("Run Now"):
         st.session_state.setdefault("logs", [])
         st.session_state.setdefault("processed_ids", set())
-        st.experimental_rerun()
+        st.rerun()
     st.write("To perform a run without auto mode, press 'Run Now' above. Auto Mode will run in background when enabled.")
 with col2:
     st.subheader("Auto Mode")
@@ -485,3 +485,4 @@ if last_logs:
 else:
     st.info("No logs yet. Click 'Execute Run Now' to run a synchronous extraction.")
 st.caption("Notes: store credentials/token securely in Streamlit secrets. If running locally, keep credentials.json and run once to generate token.json.")
+
