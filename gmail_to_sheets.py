@@ -15,6 +15,10 @@ from google.oauth2.credentials import Credentials
 from dotenv import load_dotenv
 from litellm import completion  # liteLLM
 
+if "GMAIL_CREDENTIALS" in st.secrets:
+    creds_json = json.loads(st.secrets["GMAIL_CREDENTIALS"])
+    with open("credentials.json", "w") as f:
+        json.dump(creds_json, f)
 # ---------------------------
 # CONFIG / LOAD SECRETS
 # ---------------------------
@@ -280,3 +284,4 @@ if run_insert:
 
 st.markdown("---")
 st.caption("Built with LiteLLM (Groq) + Gmail API + Trello API. Keep keys in secrets; don't commit them.")
+
